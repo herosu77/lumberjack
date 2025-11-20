@@ -3,7 +3,7 @@
 // Note that this is v2.0 of lumberjack, and should be imported using gopkg.in
 // thusly:
 //
-//   import "gopkg.in/natefinch/lumberjack.v2"
+//	import "gopkg.in/natefinch/lumberjack.v2"
 //
 // The package name remains simply lumberjack, and the code resides at
 // https://github.com/natefinch/lumberjack under the v2.0 branch.
@@ -66,7 +66,7 @@ var _ io.WriteCloser = (*Logger)(nil)
 // `/var/log/foo/server.log`, a backup created at 6:30pm on Nov 11 2016 would
 // use the filename `/var/log/foo/server-2016-11-04T18-30-00.000.log`
 //
-// Cleaning Up Old Log Files
+// # Cleaning Up Old Log Files
 //
 // Whenever a new logfile gets created, old log files may be deleted.  The most
 // recent files according to the encoded timestamp will be retained, up to a
@@ -107,12 +107,28 @@ type Logger struct {
 	// using gzip. The default is not to perform compression.
 	Compress bool `json:"compress" yaml:"compress"`
 
-	size int64
-	file *os.File
-	mu   sync.Mutex
+	// RotationInterval controls time-based log rotation. If set to a
+	// positive duration, lumberjack will rotate the log file when the
+	// wall-clock time passes the next scheduled rotation boundary,
+	// in addition to any size-based rotation controlled by MaxSize.
+	//
+	// A zero value (the default) disables time-based rotation and
+	// preserves the historical behavior of size-only rotation.
+	//
+	// For intervals shorter than 24 hours (for example time.Hour),
+	// rotation happens at fixed elapsed-time boundaries. For intervals
+	// that are whole multiples of 24 hours (for example 24*time.Hour),
+	// rotation happens on calendar day boundaries in either local time
+	// or UTC, depending on the LocalTime flag.
+	RotationInterval time.Duration `json:"rotationinterval" yaml:"rotationinterval"`
 
-	millCh    chan bool
-	startMill sync.Once
+	size           int64
+	file           *os.File
+	mu             sync.Mutex
+	millCh         chan bool
+	startMill      sync.Once
+	lastRotateTime time.Time
+	nextRotateTime time.Time
 }
 
 var (
@@ -149,7 +165,10 @@ func (l *Logger) Write(p []byte) (n int, err error) {
 		}
 	}
 
-	if l.size+writeLen > l.max() {
+	// Determine whether we need to rotate due to size or time.
+	needSizeRotate := l.size+writeLen > l.max()
+	needTimeRotate := l.shouldTimeRotate()
+	if needSizeRotate || needTimeRotate {
 		if err := l.rotate(); err != nil {
 			return 0, err
 		}
@@ -238,6 +257,10 @@ func (l *Logger) openNew() error {
 	}
 	l.file = f
 	l.size = 0
+
+	// After creating a new file, recompute the rotation schedule.
+	l.updateRotationSchedule()
+
 	return nil
 }
 
@@ -271,6 +294,24 @@ func (l *Logger) openExistingOrNew(writeLen int) error {
 	}
 	if err != nil {
 		return fmt.Errorf("error getting log file info: %s", err)
+	}
+
+	// If time-based rotation is enabled, initialize the schedule based on the
+	// existing file's modification time and decide whether to rotate instead of
+	// appending.
+	if l.RotationInterval > 0 {
+		modTime := info.ModTime()
+		if !l.LocalTime {
+			modTime = modTime.UTC()
+		} else {
+			modTime = modTime.In(time.Local)
+		}
+		l.lastRotateTime = modTime
+		l.nextRotateTime = computeNextRotateTime(modTime, l.RotationInterval)
+
+		if l.shouldTimeRotate() {
+			return l.rotate()
+		}
 	}
 
 	if info.Size()+int64(writeLen) >= l.max() {
@@ -538,4 +579,79 @@ func (b byFormatTime) Swap(i, j int) {
 
 func (b byFormatTime) Len() int {
 	return len(b)
+}
+
+// shouldTimeRotate reports whether a time-based rotation is due
+// according to RotationInterval and nextRotateTime.
+func (l *Logger) shouldTimeRotate() bool {
+	if l.RotationInterval <= 0 {
+		return false
+	}
+	if l.nextRotateTime.IsZero() {
+		return false
+	}
+	now := currentTime()
+	if !l.LocalTime {
+		now = now.UTC()
+	} else {
+		now = now.In(time.Local)
+	}
+	return !now.Before(l.nextRotateTime)
+}
+
+// updateRotationSchedule recomputes lastRotateTime and nextRotateTime
+// based on the RotationInterval and the current time.
+func (l *Logger) updateRotationSchedule() {
+	if l.RotationInterval <= 0 {
+		l.lastRotateTime = time.Time{}
+		l.nextRotateTime = time.Time{}
+		return
+	}
+
+	now := currentTime()
+	if !l.LocalTime {
+		now = now.UTC()
+	} else {
+		now = now.In(time.Local)
+	}
+	l.lastRotateTime = now
+	l.nextRotateTime = computeNextRotateTime(now, l.RotationInterval)
+}
+
+// computeNextRotateTime computes the next rotation boundary after
+// the given base time for the specified interval. Intervals that are
+// whole multiples of 24 hours rotate on calendar day boundaries;
+// shorter intervals rotate on fixed elapsed-time boundaries.
+func computeNextRotateTime(base time.Time, interval time.Duration) time.Time {
+	if interval <= 0 {
+		return time.Time{}
+	}
+
+	day := 24 * time.Hour
+	if interval%day == 0 && interval >= day {
+		// Day-based rotation: rotate on calendar day boundaries in the
+		// given location. Compute next midnight and then add extra days
+		// if interval > 24h.
+		loc := base.Location()
+		y, m, d := base.Date()
+		nextMidnight := time.Date(y, m, d+1, 0, 0, 0, 0, loc)
+		// Number of whole days represented by the interval.
+		days := int(interval / day)
+		if days <= 1 {
+			return nextMidnight
+		}
+		return nextMidnight.Add(time.Duration(days-1) * day)
+	}
+
+	// Duration-based rotation: advance to the next multiple of interval
+	// since Unix epoch in the same location.
+	// Use UTC epoch for consistency, then convert back to base.Location.
+	utc := base.UTC()
+	epoch := time.Unix(0, 0).UTC()
+	elapsed := utc.Sub(epoch)
+	rem := elapsed % interval
+	if rem == 0 {
+		return base.Add(interval)
+	}
+	return base.Add(interval - rem)
 }
