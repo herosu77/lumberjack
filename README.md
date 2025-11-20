@@ -1,5 +1,10 @@
 # lumberjack  [![GoDoc](https://godoc.org/gopkg.in/natefinch/lumberjack.v2?status.png)](https://godoc.org/gopkg.in/natefinch/lumberjack.v2) [![Build Status](https://travis-ci.org/natefinch/lumberjack.svg?branch=v2.0)](https://travis-ci.org/natefinch/lumberjack) [![Build status](https://ci.appveyor.com/api/projects/status/00gchpxtg4gkrt5d)](https://ci.appveyor.com/project/natefinch/lumberjack) [![Coverage Status](https://coveralls.io/repos/natefinch/lumberjack/badge.svg?branch=v2.0)](https://coveralls.io/r/natefinch/lumberjack?branch=v2.0)
 
+> **Note**
+> This repository is a fork of [natefinch/lumberjack](https://github.com/natefinch/lumberjack)
+> (v2 branch). The core behavior and APIs are kept compatible, with additional
+> support for time-based rotation via `RotationInterval`.
+
 ### Lumberjack is a Go package for writing logs to rolling files.
 
 Package lumberjack provides a rolling logger.
@@ -25,7 +30,7 @@ Using the same lumberjack configuration from multiple processes on the same
 machine will result in improper behavior.
 
 
-**Example**
+**Example (size-based rotation)**
 
 To use lumberjack with the standard library's log package, just pass it into the SetOutput function when your application starts.
 
@@ -40,6 +45,27 @@ log.SetOutput(&lumberjack.Logger{
     Compress:   true, // disabled by default
 })
 ```
+
+**Example (size + time-based rotation)**
+
+You can also rotate logs based on wall-clock time in addition to file size. For
+example, to rotate daily in local time:
+
+```go
+log.SetOutput(&lumberjack.Logger{
+    Filename:         "/var/log/myapp/foo.log",
+    MaxSize:          500,             // megabytes
+    MaxBackups:       7,
+    MaxAge:           30,              // days
+    Compress:         true,
+    LocalTime:        true,            // use local time for filenames & day boundaries
+    RotationInterval: 24 * time.Hour,  // rotate daily in addition to size
+})
+```
+
+For hourly rotation, use `RotationInterval: time.Hour`. A zero value for
+RotationInterval (the default) disables time-based rotation and preserves the
+original size-only behavior.
 
 
 
@@ -75,6 +101,21 @@ type Logger struct {
     // Compress determines if the rotated log files should be compressed
     // using gzip. The default is not to perform compression.
     Compress bool `json:"compress" yaml:"compress"`
+
+    // RotationInterval controls time-based log rotation. If set to a
+    // positive duration, lumberjack will rotate the log file when the
+    // wall-clock time passes the next scheduled rotation boundary,
+    // in addition to any size-based rotation controlled by MaxSize.
+    //
+    // A zero value (the default) disables time-based rotation and
+    // preserves the historical behavior of size-only rotation.
+    //
+    // For intervals shorter than 24 hours (for example time.Hour),
+    // rotation happens at fixed elapsed-time boundaries. For intervals
+    // that are whole multiples of 24 hours (for example 24*time.Hour),
+    // rotation happens on calendar day boundaries in either local time
+    // or UTC, depending on the LocalTime flag.
+    RotationInterval time.Duration `json:"rotationinterval" yaml:"rotationinterval"`
     // contains filtered or unexported fields
 }
 ```
@@ -166,9 +207,6 @@ Write implements io.Writer.  If a write would cause the log file to be larger
 than MaxSize, the file is closed, renamed to include a timestamp of the
 current time, and a new log file is created using the original log file name.
 If the length of the write is greater than MaxSize, an error is returned.
-
-
-
 
 
 

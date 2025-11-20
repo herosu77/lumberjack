@@ -707,6 +707,139 @@ func TestJson(t *testing.T) {
 	equals(true, l.Compress, t)
 }
 
+func TestTimeRotateHourly(t *testing.T) {
+	currentTime = fakeTime
+	megabyte = 1
+
+	dir := makeTempDir("TestTimeRotateHourly", t)
+	defer os.RemoveAll(dir)
+
+	filename := logFile(dir)
+	l := &Logger{
+		Filename:         filename,
+		MaxSize:          1000, // large enough to avoid size-based rotation
+		RotationInterval: time.Hour,
+		LocalTime:        false,
+	}
+	defer l.Close()
+
+	// Initial write at fakeCurrentTime.
+	b1 := []byte("first")
+	n, err := l.Write(b1)
+	isNil(err, t)
+	equals(len(b1), n, t)
+
+	existsWithContent(filename, b1, t)
+	fileCount(dir, 1, t)
+
+	// Advance time just under an hour: no rotation expected.
+	fakeCurrentTime = fakeCurrentTime.Add(59 * time.Minute)
+
+	b2 := []byte("second")
+	n, err = l.Write(b2)
+	isNil(err, t)
+	equals(len(b2), n, t)
+
+	existsWithContent(filename, append(b1, b2...), t)
+	fileCount(dir, 1, t)
+
+	// Advance past the hour boundary: rotation should occur on next write.
+	fakeCurrentTime = fakeCurrentTime.Add(2 * time.Minute)
+
+	b3 := []byte("third")
+	n, err = l.Write(b3)
+	isNil(err, t)
+	equals(len(b3), n, t)
+
+	// Current file should contain only the latest write.
+	existsWithContent(filename, b3, t)
+
+	// There should be exactly one backup containing the first two writes.
+	backup := backupFile(dir)
+	existsWithContent(backup, append(b1, b2...), t)
+	fileCount(dir, 2, t)
+}
+
+func TestTimeRotateDailyFirstWrite(t *testing.T) {
+	currentTime = fakeTime
+	megabyte = 1
+
+	dir := makeTempDir("TestTimeRotateDailyFirstWrite", t)
+	defer os.RemoveAll(dir)
+
+	filename := logFile(dir)
+	// Create an existing log file whose mod time is well in the past.
+	start := []byte("old")
+	isNil(ioutil.WriteFile(filename, start, 0600), t)
+
+	// Set fake time far in the future so that a daily rotation is due.
+	fakeCurrentTime = fakeCurrentTime.Add(48 * time.Hour)
+
+	l := &Logger{
+		Filename:         filename,
+		MaxSize:          1000,
+		RotationInterval: 24 * time.Hour,
+		LocalTime:        true,
+	}
+	defer l.Close()
+
+	b := []byte("new")
+	n, err := l.Write(b)
+	isNil(err, t)
+	equals(len(b), n, t)
+
+	// The existing file should have been rotated on the first write.
+	existsWithContent(filename, b, t)
+	existsWithContent(backupFile(dir), start, t)
+	fileCount(dir, 2, t)
+}
+
+func TestTimeAndSizeRotationCombined(t *testing.T) {
+	currentTime = fakeTime
+	megabyte = 1
+
+	dir := makeTempDir("TestTimeAndSizeRotationCombined", t)
+	defer os.RemoveAll(dir)
+
+	filename := logFile(dir)
+	l := &Logger{
+		Filename:         filename,
+		MaxSize:          2,         // very small to trigger size rotation
+		RotationInterval: time.Hour, // also enable time-based rotation
+		LocalTime:        false,
+	}
+	defer l.Close()
+
+	// First write hits size limit and rotates.
+	b1 := []byte("aa")
+	n, err := l.Write(b1)
+	isNil(err, t)
+	equals(len(b1), n, t)
+
+	// Second write should trigger rotation because of size.
+	b2 := []byte("bb")
+	n, err = l.Write(b2)
+	isNil(err, t)
+	equals(len(b2), n, t)
+
+	existsWithContent(filename, b2, t)
+	existsWithContent(backupFile(dir), b1, t)
+	fileCount(dir, 2, t)
+
+	// Advance time beyond an hour and ensure time-based rotation also works
+	// after a size-based rotation.
+	fakeCurrentTime = fakeCurrentTime.Add(2 * time.Hour)
+
+	b3 := []byte("cc")
+	n, err = l.Write(b3)
+	isNil(err, t)
+	equals(len(b3), n, t)
+
+	// Should have rotated again due to time.
+	existsWithContent(filename, b3, t)
+	fileCount(dir, 3, t)
+}
+
 // makeTempDir creates a file with a semi-unique name in the OS temp directory.
 // It should be based on the name of the test, to keep parallel tests from
 // colliding, and must be cleaned up after the test is finished.
